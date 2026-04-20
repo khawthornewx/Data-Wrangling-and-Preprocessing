@@ -1,0 +1,87 @@
+#Since we are working in a python3 environment, we first need to setup our environment by pip installing what may not already exist
+pip install xarray numpy pandas matplotlib
+
+#After we have pip installed the necessary packages, we now can import all the packages we will use over the course of opening the dataset
+import matplotlib.pyplot as plt
+from tqdm import tqdm #tqdm is a progress bar that will help follow the progress of opening such large data to ensure everything is working properly
+import pandas as pd
+import xarray as xr 
+import numpy as np
+import datetime
+import glob
+import os
+
+#Path Specification
+base_dir = "/glade/campaign/ncar/USGS_Water/CONUS404_PGW" #This is the data we are opening
+out_dir = "/glade/derecho/scratch/khawthorne/485 project data" #This is where the final .nc file will live once created
+geo_path = "/glade/derecho/scratch/khawthorne/CONUS404_geography.nc" #This is the geography file that specifies lat/long for the dataset to be plotted
+
+os.makedirs(out_dir, exist_ok=True)
+
+#Geography
+geo = xr.open_dataset(geo_path) #We are first opening the geography file
+geo_econus = geo.isel(west_east=slice(107, None)) #Using the geo file information we are slicing to the eastern CONUS (ECONUS) so our dataset will only open east of this longitude
+
+#Time/Datetime
+#CONUS404 data is output in minutes since initialization. This is the case for a lot of raw wrfout type files. Work needs to be done to convert that accordingly using datetime features.
+def get_file_time(path): #This helper function allows us to pull the correct UTC date/time from the file name and apply it to the file time in the new dataset
+    m = re.search(
+        r"wrf3d_d01_(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}:\d{2})",
+        os.path.basename(path)
+    )
+    if m:
+        return pd.to_datetime(m.group(1), format="%Y-%m-%d_%H:%M:%S")
+    return pd.NaT
+
+#Variable Selection
+#To further minimze the computation expense of opening and saving this data, we can subset the dataset by only variables we will use for our project
+def preprocess(ds):
+    # keep only needed variables
+    ds = ds[["Z", "P", "TK", "XLAT", "XLON"]] #Z = geopotential height, P = pressure, TK = temperature in kelvin, XLAT/XLON are from geo files and make data plotable 
+
+    # subset to ECONUS by index
+    ds = ds.isel(west_east=slice(107, None))
+
+    # get time from filename
+    src = ds.encoding.get("source", "")
+    file_time = get_file_time(src)
+
+    # assign filename time
+    ds = ds.assign_coords(time=("Time", [file_time]))
+    ds = ds.swap_dims({"Time": "time"})
+
+    return ds
+
+#Temporal Chunking
+#Since we are only working on a certain period, we will chunk the data only by the years we will use. This is more computationally efficient than opening the entire 43 year dataset. 
+years = range(2008, 2025)
+
+for wy in tqdm(years, desc="Water years"):
+    file_list = sorted(glob.glob(os.path.join(base_dir, f"WY{wy}", "wrf3d_d01_*")))
+
+    if not file_list:
+        print(f"No files found for WY{wy}")
+        continue
+
+#Opening dataset and saving
+ ds_chunk = xr.open_mfdataset(
+        tqdm(file_list, desc=f"Opening files WY{wy}", leave=False),
+        preprocess=preprocess,
+        combine="nested",
+        concat_dim="time",
+        parallel=False,
+        engine="netcdf4",
+        chunks={"time": 1}
+    )
+
+    for coord_name in geo_econus.data_vars:
+        if geo_econus[coord_name].dims == ("south_north", "west_east"):
+            ds_chunk[coord_name] = geo_econus[coord_name]
+
+    ds_chunk = ds_chunk.sortby("time")
+
+    out_file = os.path.join(out_dir, f"wrf3d_ECONUS_Z_P_TK_WY{wy}.nc")
+
+    print(f"Saving {out_file}")
+    ds_chunk.to_netcdf(out_file)
+    ds_chunk.close() 
